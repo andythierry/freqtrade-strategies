@@ -1,0 +1,33 @@
+{
+  "strategy_name": "MagicStratScalp_v5",
+  "params": {
+    "roi": {
+      "0": 0.02
+    },
+    "stoploss": {
+      "stoploss": -0.03
+    },
+    "trailing": {
+      "trailing_stop": false,
+      "trailing_stop_positive": null,
+      "trailing_stop_positive_offset": 0.0,
+      "trailing_only_offset_is_reached": false
+    },
+    "max_open_trades": {
+      "max_open_trades": 5
+    },
+    "buy": {
+      "ema_gap_ratio_buy": 0.92,
+      "rsi_threshold": 10.0,
+      "volume_multiplier": 1.94
+    },
+    "sell": {
+      "ema_gap_ratio_sell": 0.91,
+      "sell_rsi_threshold": 66.0,
+      "stop_loss_hyp": -0.05
+    },
+    "protection": {}
+  },
+  "ft_stratparam_v": 1,
+  "export_time": "2025-08-05 17:16:45.038129+00:00"
+}
