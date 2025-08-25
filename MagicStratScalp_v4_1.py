@@ -23,6 +23,10 @@ class MagicStratScalp_v4(IStrategy):
     minimal_roi = {"0": 0.02}
     stoploss = -0.01
     trailing_stop = True
+    trailing_stop_positive = 0.005
+    trailing_stop_positive_offset = 0.01
+    trailing_only_offset_is_reached = True
+
     process_only_new_candles = True
     use_custom_stoploss = False
     use_exit_signal = True
