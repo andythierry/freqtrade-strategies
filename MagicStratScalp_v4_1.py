@@ -6,7 +6,7 @@ import talib.abstract as ta
 import numpy as np
 from typing import Optional
 
-class MagicStratScalp_v4(IStrategy):
+class MagicStratScalp_v4_1(IStrategy):
     timeframe = '5m'
     informative_timeframe = '1h'
     startup_candle_count: int = 50
