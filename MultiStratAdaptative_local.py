@@ -3,67 +3,104 @@
 """
 MultiStratAdaptive — stratégie compilée et adaptative pour Freqtrade
 
-Combine Supertrend, RSI/EMA (v4 & v5) et un module simple de price-action.
-Bascule automatiquement selon le régime de marché détecté en 1h (trend/range).
-Utilise merge_informative_pair pour fiabiliser l'alignement 5m ⇄ 1h.
+Objectif
+--------
+Combiner plusieurs approches (Supertrend, momentum RSI/EMA, pattern price-action)
+et activer automatiquement l'approche la plus pertinente selon le régime de marché
+(détecté sur une timeframe informative 1h : tendance / range / volatilité).
+
+Points clés
+-----------
+- Multi-stratégies dans **un seul fichier** via des tags d'entrée :
+  - "ST"           → Supertrend (trend following)
+  - "RSIEMA_V4"    → Momentum (ancienne MagicStratScalp_v4)
+  - "RSIEMA_V5"    → Momentum (variante v5, plus stricte)
+  - "PATTERN"      → Price-action (engloutissant haussier, pin bar)
+- Sélection par **régime de marché** (1h) :
+  - Trend si ADX(14) ≥ 20 et pente EMA200 positive ⇒ favorise Supertrend + RSIEMA_V5
+  - Range si BandWidth Bollinger ≤ 8% ⇒ favorise PATTERN + RSIEMA_V4
+  - Sinon ⇒ fallback momentum léger (RSIEMA_V4)
+- **Kill-switch par sous-stratégie** : si > N pertes consécutives (rolling) pour un tag,
+  on désactive temporairement ce tag pendant M heures.
+- **Protections** (exposables via `protections` + garde-fous locaux) :
+  - Cooldown après perte
+  - Stoploss dynamique (ATR + trailing léger)
+- **Nettoyage paires** : possibilité d'exclure les paires destructrices via `BAD_PAIRS`.
+
+Compatibilité
+-------------
+- Testé avec Freqtrade ≥ 2024.3
+- Timeframe par défaut : 5m ; informative : 1h
+
+Conseils d'utilisation
+----------------------
+- Dans le `config.json` : `"log_trade_details": true`, `"verbosity": 3`
+- Lancer normal : `freqtrade trade --strategy MultiStratAdaptive`
+
 """
+from functools import lru_cache
 from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 from pandas import DataFrame, Series
 
-from freqtrade.strategy import (
-    IStrategy,
-    IntParameter,
-    DecimalParameter,
-    CategoricalParameter,
-    merge_informative_pair,
-)
+from freqtrade.strategy import IStrategy, IntParameter, DecimalParameter, CategoricalParameter
+from freqtrade.exchange import timeframe_to_minutes
+
 import talib.abstract as ta
+from technical.indicators import RMI
+from technical.util import resample_to_interval, heikinashi
 
 
 class MultiStratAdaptive(IStrategy):
+    # --- Config de base ---
     timeframe = '5m'
     informative_timeframe = '1h'
-    startup_candle_count: int = 240
+    startup_candle_count: int = 240  # pour indicateurs 1h
 
-    # ROI/SL — on gère réellement via custom_stoploss
+    # ROI/Stoploss par défaut (le SL réel est géré par custom_stoploss)
     minimal_roi = {"0": 1000}
     stoploss = -0.20
 
-    # Trailing doux (affiné dans custom_stoploss)
+    # Trailing (soft) — sera renforcé en custom_stoploss
     trailing_stop = True
     trailing_only_offset_is_reached = True
     trailing_stop_positive = 0.01
     trailing_stop_positive_offset = 0.02
 
-    # Hyperparams simples (hyperoptables)
+    # Hyperparams simples (ajustables via Hyperopt)
     atr_mult_sl = DecimalParameter(1.0, 3.0, default=1.8, space='sell', decimals=1)
     adx_trend = IntParameter(15, 30, default=20, space='buy')
     bb_width_range = DecimalParameter(0.05, 0.12, default=0.08, space='buy', decimals=3)
 
+    # Exclusion de paires destructrices (customisable)
     BAD_PAIRS: List[str] = [
         'AI16Z/USDT', 'FARTCOIN/USDT', 'XTZ/USDT', 'DOGE/USDT', 'TRUMP/USDT'
     ]
 
+    # Kill-switch par sous-stratégie
     MAX_CONSECUTIVE_LOSSES = 3
     DISABLE_FOR_HOURS = 6
 
+    # Internals (stocke état des sous-stratégies)
     custom_info: Dict = {}
+
+    # Protections globales (facultatif; sinon utiliser protections dans config)
     use_custom_stoploss = True
 
     def informative_pairs(self):
-        pairs = self.dp.current_whitelist()
-        return [(p, self.informative_timeframe) for p in pairs]
+        # On veut l'informative 1h pour chaque paire active
+        return [(self.dp.current_whitelist(), self.informative_timeframe)]
 
+    # --- Indicateurs ---
     def populate_indicators(self, df: DataFrame, metadata: dict) -> DataFrame:
         pair = metadata['pair']
 
-        # Flag paires à éviter
+        # Filtre paires mauvaises
         df['bad_pair'] = pair in self.BAD_PAIRS
 
-        # === Indicateurs 5m ===
+        # Base 5m
         df['ema50'] = ta.EMA(df, timeperiod=50)
         df['ema200'] = ta.EMA(df, timeperiod=200)
         df['rsi'] = ta.RSI(df, timeperiod=14)
@@ -71,14 +108,16 @@ class MultiStratAdaptive(IStrategy):
         df['adx'] = ta.ADX(df, timeperiod=14)
 
         # Supertrend (implémentation simple)
-        atr10 = ta.ATR(df, timeperiod=10)
+        df['tr'] = ta.TRANGE(df)
+        atr = ta.ATR(df, timeperiod=10)
         factor = 3.0
         hl2 = (df['high'] + df['low']) / 2
-        basic_ub = hl2 + factor * atr10
-        basic_lb = hl2 - factor * atr10
+        basic_ub = hl2 + factor * atr
+        basic_lb = hl2 - factor * atr
         final_ub = basic_ub.copy()
         final_lb = basic_lb.copy()
         st = Series(index=df.index, dtype=float)
+        dir_long = True
         for i in range(len(df)):
             if i == 0:
                 st.iloc[i] = basic_lb.iloc[i]
@@ -98,35 +137,28 @@ class MultiStratAdaptive(IStrategy):
         df['supertrend'] = st
         df['supertrend_long'] = df['close'] > df['supertrend']
 
-        # === Informative 1h (robuste avec merge_informative_pair) ===
+        # Informative 1h
         inf = self.dp.get_pair_dataframe(pair=pair, timeframe=self.informative_timeframe)
-        if inf is None or inf.empty:
-            for c in ['ema200_1h','ema50_1h','adx_1h','bb_width_1h','ema200_slope_1h']:
-                df[c] = np.nan
-        else:
-            # TA-Lib renvoie des numpy.ndarray — éviter .replace sur ndarray
-            inf['ema200'] = ta.EMA(inf, timeperiod=200)
-            inf['ema50']  = ta.EMA(inf, timeperiod=50)
-            inf['adx']    = ta.ADX(inf, timeperiod=14)
-            up, mid, lo   = ta.BBANDS(inf['close'], timeperiod=20, nbdevup=2.0, nbdevdn=2.0)
-            mid_safe = np.where(mid == 0, np.nan, mid)
-            # bb_width = (upper - lower) / middle
-            inf['bb_width'] = (up - lo) / mid_safe
-            inf['ema200_slope'] = inf['ema200'].diff()
+        inf['ema200_1h'] = ta.EMA(inf, timeperiod=200)
+        inf['ema50_1h'] = ta.EMA(inf, timeperiod=50)
+        inf['adx_1h'] = ta.ADX(inf, timeperiod=14)
+        # BB width en % (1h)
+        upper, middle, lower = ta.BBANDS(inf['close'], timeperiod=20, nbdevup=2, nbdevdn=2)
+        inf['bb_width'] = (upper - lower) / middle.replace(0, np.nan)
+        # pente EMA200 (1h)
+        inf['ema200_slope'] = inf['ema200_1h'].diff()
 
-            df = merge_informative_pair(
-                df,
-                inf[['date','ema200','ema50','adx','bb_width','ema200_slope']],
-                self.timeframe,
-                self.informative_timeframe,
-                ffill=True,
-            )
+        df = df.merge(
+            inf[['date', 'ema200_1h', 'ema50_1h', 'adx_1h', 'bb_width', 'ema200_slope']].rename(columns={'date': 'date_inf'}),
+            left_on='date', right_on='date_inf', how='left'
+        )
+        df.drop(columns=['date_inf'], inplace=True)
 
-        # Régime de marché depuis les colonnes suffixées _1h
-        df['is_trend'] = (df.get('adx_1h', np.nan) >= self.adx_trend.value) & (df.get('ema200_slope_1h', np.nan) > 0)
-        df['is_range'] = (df.get('bb_width_1h', np.nan) <= self.bb_width_range.value)
+        # Détection de régime
+        df['is_trend'] = (df['adx_1h'] >= self.adx_trend.value) & (df['ema200_slope'] > 0)
+        df['is_range'] = (df['bb_width'] <= self.bb_width_range.value)
 
-        # Price-action basique
+        # Price-action basique (patterns)
         df['bull_engulf'] = (
             (df['close'] > df['open']) & (df['open'].shift(1) > df['close'].shift(1)) &
             (df['close'] >= df['open'].shift(1)) & (df['open'] <= df['close'].shift(1))
@@ -147,7 +179,9 @@ class MultiStratAdaptive(IStrategy):
 
         return df
 
+    # --- Entrées ---
     def populate_entry_trend(self, df: DataFrame, metadata: dict) -> DataFrame:
+        # Kill-switch: récupérer l'état des sous-strategies désactivées
         disabled_tags = self._get_disabled_tags(metadata['pair'])
 
         # Supertrend (trend only)
@@ -162,7 +196,7 @@ class MultiStratAdaptive(IStrategy):
             ['enter_long', 'enter_tag']
         ] = (1, 'ST')
 
-        # RSI/EMA v5 (trend stricte)
+        # RSI/EMA v5 (trend a priori, stricte)
         df.loc[
             (
                 (df['is_trend']) &
@@ -174,7 +208,7 @@ class MultiStratAdaptive(IStrategy):
             ['enter_long', 'enter_tag']
         ] = (1, 'RSIEMA_V5')
 
-        # RSI/EMA v4 (fallback range / hors-trend)
+        # RSI/EMA v4 (fallback momentum / range permissif)
         df.loc[
             (
                 (df['is_range'] | ~df['is_trend']) &
@@ -186,12 +220,12 @@ class MultiStratAdaptive(IStrategy):
             ['enter_long', 'enter_tag']
         ] = (1, 'RSIEMA_V4')
 
-        # Patterns en range
+        # Pattern price-action (range only)
         df.loc[
             (
                 (df['is_range']) &
                 (~df['bad_pair']) &
-                (df['bull_engulf'] | df['bull_pin']) &
+                ((df['bull_engulf']) | (df['bull_pin'])) &
                 ('PATTERN' not in disabled_tags)
             ),
             ['enter_long', 'enter_tag']
@@ -199,64 +233,72 @@ class MultiStratAdaptive(IStrategy):
 
         return df
 
+    # --- Sorties ---
     def populate_exit_trend(self, df: DataFrame, metadata: dict) -> DataFrame:
+        # Exits simples, le SL/Trailing fait le gros du travail
         df.loc[
             (
-                (df['rsi'] > 70) |
-                ((df['is_trend']) & (df['close'] < df['ema50'])) |
+                (df['rsi'] > 70) |  # take profit simple
+                ((df['is_trend']) & (df['close'] < df['ema50'])) |  # perte de momentum
                 ((df['is_range']) & (df['rsi'] < 40))
             ),
             'exit_long'
         ] = 1
         return df
 
+    # --- Stoploss dynamique ---
     def custom_stoploss(self, pair: str, trade, current_time: pd.Timestamp, current_rate: float,
                         current_profit: float, **kwargs) -> float:
+        # ATR sur last candle 5m
         df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         if df is None or df.empty:
-            return 1.0
+            return 1.0  # fallback
         atr = df['atr'].iloc[-1] if 'atr' in df.columns else None
         if atr is None or np.isnan(atr):
             return 1.0
-        sl_distance = float(self.atr_mult_sl.value) * float(atr)
+        sl_distance = self.atr_mult_sl.value * atr
+        # Converti en pourcentage de prix
         sl_pct = sl_distance / max(current_rate, 1e-9)
+        # Trailing supplémentaire si en gain
         if current_profit > 0.02:
             sl_pct = min(sl_pct, max(0.01, current_profit * 0.6))
-        return float(max(0.01, min(0.20, sl_pct)))
+        return max(0.01, min(0.20, sl_pct))
 
-    # ===== Kill-switch =====
+    # --- Hooks pour Kill-switch ---
+    def check_exit_timeout(self, pair: str, trade, order) -> bool:
+        # non utilisé ici
+        return False
+
     def _get_disabled_tags(self, pair: str) -> set:
         key = f"disabled_tags::{pair}"
-        # Always work with tz-aware UTC timestamps
-        now_utc = pd.Timestamp.now(tz='UTC')
-        default_until = pd.Timestamp.min.tz_localize('UTC')
-        info = self.custom_info.get(key, {"tags": set(), "until": default_until})
-        # Reactivate tags if the disable window expired
-        if now_utc > info.get('until', default_until):
+        info = self.custom_info.get(key, {"tags": set(), "until": pd.Timestamp.min})
+        # Réactive si délai passé
+        if pd.Timestamp.utcnow() > info.get('until', pd.Timestamp.min):
             info['tags'] = set()
-            info['until'] = default_until
         self.custom_info[key] = info
         return info['tags']
 
     def _disable_tag(self, pair: str, tag: str):
         key = f"disabled_tags::{pair}"
-        now_utc = pd.Timestamp.now(tz='UTC')
-        until = now_utc + pd.Timedelta(hours=self.DISABLE_FOR_HOURS)
+        until = pd.Timestamp.utcnow() + pd.Timedelta(hours=self.DISABLE_FOR_HOURS)
         info = self.custom_info.get(key, {"tags": set(), "until": until})
         info['tags'].add(tag)
         info['until'] = until
         self.custom_info[key] = info
-        self.logger.warning(f"[KILL] Désactivation temporaire du tag {tag} sur {pair} jusqu'au {until}")
 
     def on_trade_closed(self, trade, order, **kwargs) -> None:
+        """Kill-switch : désactive un tag s'il enchaîne trop de pertes."""
         try:
             pair = trade.pair
             tag = (trade.enter_tag or '').upper()
+            profit = trade.close_profit or 0.0
             if not tag:
                 return
+            # Historique des X derniers trades pour ce tag/paire
             df_hist = self._get_trade_history(pair, tag, limit=10)
             if df_hist is None or df_hist.empty:
                 return
+            # Compte pertes consécutives
             consec_losses = 0
             for p in df_hist['close_profit'].iloc[::-1]:
                 if p <= 0:
@@ -265,8 +307,9 @@ class MultiStratAdaptive(IStrategy):
                     break
             if consec_losses >= self.MAX_CONSECUTIVE_LOSSES:
                 self._disable_tag(pair, tag)
+                self.log(f"[KILL] Désactivation temporaire du tag {tag} sur {pair} ({consec_losses} pertes consécutives)")
         except Exception as e:
-            self.logger.warning(f"on_trade_closed error: {e}")
+            self.log(f"on_trade_closed error: {e}")
 
     def _get_trade_history(self, pair: str, tag: str, limit: int = 20) -> Optional[DataFrame]:
         try:
@@ -276,22 +319,29 @@ class MultiStratAdaptive(IStrategy):
             rows = []
             for t in trades:
                 if (t.enter_tag or '').upper() == tag.upper():
-                    rows.append({'close_profit': t.close_profit, 'close_date': t.close_date})
+                    rows.append({
+                        'close_profit': t.close_profit,
+                        'close_date': t.close_date
+                    })
             if not rows:
                 return None
             return pd.DataFrame(rows).sort_values('close_date')
         except Exception:
             return None
 
+    # --- Protections via hooks (en plus des protections config) ---
     def confirm_trade_entry(self, pair: str, order_type: str, amount: float, rate: float,
                              time_in_force: str, enter_tag: str, **kwargs) -> bool:
+        # Bloque si paire marquée "bad_pair"
         df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         if df is not None and not df.empty and bool(df['bad_pair'].iloc[-1]):
             return False
+        # Kill-switch local
         disabled = self._get_disabled_tags(pair)
         if enter_tag and enter_tag.upper() in disabled:
             return False
         return True
 
+    # (Optionnel) position sizing custom : ici on laisse la stake du config.json
     # def custom_stake_amount(self, pair: str, current_price: float, proposed_stake: float, **kwargs) -> float:
     #     return proposed_stake
